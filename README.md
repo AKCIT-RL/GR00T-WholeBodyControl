@@ -45,6 +45,12 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 - [Kinematic Planner](#kinematic-planner)
 - [SONIC Training](#sonic-training)
 - [TODOs](#todos)
+- [Simulation Quickstart (Docker)](#simulation-quickstart-docker)
+  - [Installation](#1-installation)
+  - [Download Model Checkpoints](#2-download-model-checkpoints)
+  - [Install the MuJoCo Simulator](#3-install-the-mujoco-simulator)
+  - [Running with the Built-in Planner](#running-with-the-built-in-planner-normal-motion)
+  - [Running with ZMQ from a .pt file](#running-with-zmq-streaming-from-a-pt-motion-file)
 - [What's Included](#whats-included)
   - [Setup](#setup)
 - [Documentation](#documentation)
@@ -209,6 +215,142 @@ For the full guide including multi-node training, evaluation, ONNX export, and S
 - [ ] Publish additional preprocessed large-scale human motion datasets
 
 
+
+## Simulation Quickstart (Docker)
+
+This section covers everything needed to run SONIC in MuJoCo simulation — from installation to driving the robot with the built-in planner or with your own motion data streamed via ZMQ.
+
+### 1. Installation
+
+Follow the full deployment installation guide (covers Docker, ROS 2, and C++ build):
+📖 [Deployment Installation Guide](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/installation_deploy.html)
+
+From the repo root, launch the development Docker container:
+
+```bash
+cd gear_sonic_deploy
+./docker/run-ros2-dev.sh
+```
+
+The container mounts the repo at `/workspace/g1_deploy`. Build the C++ inference binary inside it when prompted.
+
+### 2. Download Model Checkpoints
+
+📖 [Download Models Guide](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/download_models.html)
+
+On the **host** (outside Docker), from the repo root:
+
+```bash
+uv run python download_from_hf.py
+```
+
+This downloads the SONIC ONNX checkpoints to:
+- `gear_sonic_deploy/policy/release/` — encoder + decoder models
+- `gear_sonic_deploy/planner/target_vel/V2/` — kinematic planner
+
+### 3. Install the MuJoCo Simulator
+
+On the **host**, from the repo root:
+
+```bash
+bash install_scripts/install_mujoco_sim.sh
+```
+
+This creates `.venv_sim` automatically.
+
+---
+
+### Running with the Built-in Planner (Normal Motion)
+
+Run two terminals. Start the MuJoCo sim first, then the deployment.
+
+**Terminal 1 — MuJoCo simulator** (host, from repo root):
+
+```bash
+source .venv_sim/bin/activate
+python gear_sonic/scripts/run_sim_loop.py
+```
+
+**Terminal 2 — C++ deployment** (inside Docker or host, from `gear_sonic_deploy/`):
+
+```bash
+bash deploy.sh sim
+```
+
+**Key bindings in Terminal 2:**
+
+| Key | Action |
+|-----|--------|
+| `]` | Start the control system |
+| `9` | Drop the robot to the ground (MuJoCo window) |
+| `T` | Play current reference motion |
+| `N` / `P` | Next / Previous motion sequence |
+| `R` | Restart current motion from beginning |
+| `O` | Emergency stop — exit immediately |
+
+---
+
+### Running with ZMQ Streaming from a `.pt` Motion File
+
+Use this to drive the robot with SMPL poses from your own motion capture inference (e.g., HMR4D output).
+
+**Terminal 1 — MuJoCo simulator** (host, from repo root):
+
+```bash
+source .venv_sim/bin/activate
+python gear_sonic/scripts/run_sim_loop.py
+```
+
+**Terminal 2 — C++ deployment with ZMQ input** (inside Docker or host, from `gear_sonic_deploy/`):
+
+```bash
+bash deploy.sh --input-type zmq --zmq-host localhost sim
+```
+
+**Terminal 3 — ZMQ publisher** (host, from repo root):
+
+```bash
+source .venv_sim/bin/activate
+python stream_hmr4d_smpl.py --loop --fps 30
+```
+
+> `stream_hmr4d_smpl.py` loads `hmr4d_results.pt` (HMR4D output), converts SMPL poses using
+> the same pipeline as the PICO VR streamer, and publishes them over ZMQ on port 5556.
+
+**Activation sequence in Terminal 2 (order matters):**
+
+| Step | Key | Expected output |
+|------|-----|-----------------|
+| 1 | `]` | Control system started |
+| 2 | `9` (MuJoCo window) | Robot drops to ground |
+| 3 | `ENTER` | `ZMQ STREAMING MODE: ENABLED` |
+| — | — | Robot begins imitating SMPL poses |
+| Stop | `O` | Emergency stop |
+
+Press `ENTER` again to toggle back to reference motion mode.
+
+**Inspect your `.pt` file without streaming:**
+
+```bash
+python stream_hmr4d_smpl.py --inspect
+```
+
+**Available options:**
+
+```
+--pt PATH          Path to hmr4d_results.pt (default: hmr4d_results.pt)
+--fps FLOAT        Playback speed in frames per second (default: 30)
+--loop             Loop the sequence indefinitely
+--smpl-source      global | incam  (default: global)
+--neutral-heading  Send identity body_quat — prevents heading snap on start (default: on)
+--port INT         ZMQ port (default: 5556)
+```
+
+> **Note on jumps:** The SONIC SMPL encoder mode does not receive root height as input — only
+> body-local joint positions. Ground-contact motions (walking, crouching, gestures) translate
+> well; aerial motions like jumps are not supported in this mode.
+
+---
 
 ## What's Included
 

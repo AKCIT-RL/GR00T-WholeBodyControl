@@ -3,6 +3,14 @@
 #   pip install -e decoupled_wbc/        (or decoupled_wbc[full], decoupled_wbc[dev])
 #   pip install -e gear_sonic/           (or gear_sonic[teleop], gear_sonic[sim])
 
+[project]
+name = "gr00t-wholebodycontrol-workspace"
+version = "0.0.0"
+requires-python = ">=3.10"
+dependencies = [
+  "huggingface_hub>=0.23",
+]
+
 [tool.black]
 line-length = 100
 include = '\.pyi?$'
