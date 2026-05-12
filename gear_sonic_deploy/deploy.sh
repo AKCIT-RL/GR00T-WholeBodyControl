@@ -387,6 +387,12 @@ if [[ "$ENV_TYPE" == "sim" ]]; then
     echo ""
 fi
 
+# Append CSV logging flags if SONIC_LOGS_DIR is set (used for RQ3 eval)
+if [[ -n "${SONIC_LOGS_DIR:-}" ]]; then
+    EXTRA_ARGS="$EXTRA_ARGS --enable-csv-logs --logs-dir $SONIC_LOGS_DIR"
+    echo -e "${YELLOW}📋 CSV logging enabled → $SONIC_LOGS_DIR${NC}"
+fi
+
 # ============================================================================
 # Step 1: Check Prerequisites
 # ============================================================================
