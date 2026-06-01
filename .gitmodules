@@ -1,0 +1,7 @@
+[submodule "external_dependencies/GMR"]
+	path = external_dependencies/GMR
+	url = https://github.com/AKCIT-RL/GMR
+	branch = pr/169
+[submodule "external_dependencies/htwk-gym"]
+	path = external_dependencies/htwk-gym
+	url = https://github.com/NaoHTWK/htwk-gym

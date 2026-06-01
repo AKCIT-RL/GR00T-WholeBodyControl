@@ -176,6 +176,40 @@ class G1Converter(IsaacLabMuJoCoConverter):
         }
 
 
+class T1Converter(IsaacLabMuJoCoConverter):
+    """Booster T1 29-DOF joint/body order converter between IsaacLab and MuJoCo conventions.
+
+    T1 has nu=27 actuated DOFs and 32 real bodies (33 total including world).
+    The Isaac Lab URDF and MuJoCo MJCF share the same joint ordering for T1
+    (MJCF-derived URDF), so all index mappings are identity permutations.
+    """
+
+    def __init__(self):
+        from gear_sonic.envs.manager_env.robots.booster_t1_29dof import (
+            T1_ISAACLAB_JOINTS,
+            T1_ISAACLAB_TO_MUJOCO_BODY,
+            T1_ISAACLAB_TO_MUJOCO_DOF,
+            T1_MUJOCO_TO_ISAACLAB_BODY,
+            T1_MUJOCO_TO_ISAACLAB_DOF,
+        )
+
+        self.JOINT_NAMES = T1_ISAACLAB_JOINTS
+        self.DOF_MAPPINGS = {
+            ("isaaclab", "mujoco"): T1_ISAACLAB_TO_MUJOCO_DOF,
+            ("mujoco", "isaaclab"): T1_MUJOCO_TO_ISAACLAB_DOF,
+        }
+        self.BODY_MAPPINGS = {
+            ("isaaclab", "mujoco"): T1_ISAACLAB_TO_MUJOCO_BODY,
+            ("mujoco", "isaaclab"): T1_MUJOCO_TO_ISAACLAB_BODY,
+        }
+
+    # T1 body names for VR tracking and foot contact.
+    # VR: head (H2) + two hand end-effectors
+    # FOOT: foot links (T1 has no ankle_roll_link; left_foot_link is the contact body)
+    VR_3POINTS_BODY_NAMES = ["Trunk", "left_hand_link", "right_hand_link"]
+    FOOT_BODY_NAMES = ["left_foot_link", "right_foot_link"]
+
+
 class H2Converter(IsaacLabMuJoCoConverter):
     """H2 robot joint/body order converter between IsaacLab and MuJoCo conventions."""
 

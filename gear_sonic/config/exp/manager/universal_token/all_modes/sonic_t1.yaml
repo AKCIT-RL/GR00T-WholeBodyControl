@@ -1,0 +1,218 @@
+# @package _global_
+# SONIC Booster T1 29-DOF config — 4 encoders (motion tracking, teleop, SMPL, SOMA).
+# Mirrors sonic_bones_seed.yaml. T1 specifics: 27 actuated DOFs, 32 bodies (nu=27).
+# Train from SCRATCH — do NOT load sonic_release/last.pt (G1 shape mismatch).
+
+defaults:
+  - /algo: ppo_im_phc
+  - /manager_env: base_env
+  - /callbacks/read_eval
+  - /callbacks/im_resample
+  - /aux_losses: universal_token/g1_recon_and_all_latent_soma
+  - override /trainer: trl_ppo_aux
+  - override /actor_critic: universal_token/all_mlp_v1_soma
+  - override /manager_env/observations/tokenizer: unitoken_all_noz_soma
+  - override /manager_env/observations/policy: local_dir_hist
+  - override /manager_env/observations/critic: privileged_mf_hist
+  - override /manager_env/events: tracking/level0_4
+  - override /manager_env/terminations: tracking/base_adaptive_strict_ori_foot_xyz
+  - override /manager_env/rewards: tracking/base_5point_local_feet_acc
+
+use_manager_env: true
+
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: test
+experiment_name: ${exp_base}_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 4096
+project_name: TRL_T1_Track
+
+actor_prop_history_length: 10
+actor_actions_history_length: 10
+
+critic_prop_history_length: 10
+critic_actions_history_length: 10
+
+manager_env:
+  config:
+    robot:
+      type: booster_t1_29dof
+    terrain_type: trimesh
+
+  # ── Observation overrides ──────────────────────────────────────────────────
+  observations:
+    tokenizer:
+      # T1 wrist DOF indices (0-based, nu=27):
+      # Left:  Wrist_Pitch=4, Wrist_Yaw=5, Hand_Roll=6
+      # Right: Wrist_Pitch=11, Wrist_Yaw=12, Hand_Roll=13
+      joint_pos_multi_future_wrist_for_smpl:
+        params:
+          joints_idx: [4, 5, 6, 11, 12, 13]
+      joint_pos_multi_future_wrist_for_soma:
+        params:
+          joints_idx: [4, 5, 6, 11, 12, 13]
+
+
+  commands:
+    motion:
+      # T1: URDF has 29 revolute joints (27 body + 2 head); motion_lib has 27.
+      # The mismatch path uses T1_ISAACLab_ORDER from joint_utils.py.
+      motion_lib_num_dof: 27
+      hand_default_positions: [0.0, 0.0]   # head joints frozen at default 0
+      hand_default_velocities: [0.0, 0.0]
+      # ── T1 body name remap vs G1 ──────────────────────────────────────────
+      # pelvis              → Trunk           (root body, no separate pelvis)
+      # torso_link          → Waist           (body after waist joint DOF14)
+      # head_link           → H2              (head link in T1 tree)
+      # left_hip_roll_link  → Hip_Roll_Left
+      # right_hip_roll_link → Hip_Roll_Right
+      # left_knee_link      → Shank_Left      (lower leg body)
+      # right_knee_link     → Shank_Right
+      # left_ankle_roll_link  → left_foot_link   (no separate ankle roll body)
+      # right_ankle_roll_link → right_foot_link
+      # left_shoulder_roll_link → AL2         (shoulder roll link)
+      # right_shoulder_roll_link → AR2
+      # left_elbow_link     → AL3             (elbow pitch link)
+      # right_elbow_link    → AR3
+      # left_wrist_yaw_link → AL6             (wrist yaw link)
+      # right_wrist_yaw_link → AR6
+      # ──────────────────────────────────────────────────────────────────────
+      anchor_body: "Trunk"
+      vr_3point_body: ["H2", "left_hand_link", "right_hand_link"]
+      vr_3point_body_offset: [[0.0, 0.0, 0.1], [0.18, -0.025, 0.0], [0.18, 0.025, 0.0]]
+      reward_point_body:
+        - "Trunk"
+        - "left_hand_link"
+        - "right_hand_link"
+        - "left_foot_link"
+        - "right_foot_link"
+      reward_point_body_offset:
+        - [0.0, 0.0, 0.0]
+        - [0.18, -0.025, 0.0]
+        - [0.18,  0.025, 0.0]
+        - [0.0, 0.0, 0.0]
+        - [0.0, 0.0, 0.0]
+      # 17 bodies tracked in motion library (14 MuJoCo + H2/hands for VR-3point)
+      body_names:
+        - "Trunk"
+        - "Hip_Roll_Left"
+        - "Shank_Left"
+        - "left_foot_link"
+        - "Hip_Roll_Right"
+        - "Shank_Right"
+        - "right_foot_link"
+        - "Waist"
+        - "AL2"
+        - "AL3"
+        - "AL6"
+        - "AR2"
+        - "AR3"
+        - "AR6"
+        - "H2"
+        - "left_hand_link"
+        - "right_hand_link"
+
+      num_future_frames: 10
+      dt_future_ref_frames: 0.1
+      smpl_num_future_frames: 10
+      smpl_dt_future_ref_frames: 0.02
+      cat_upper_body_poses: true
+      cat_upper_body_poses_prob: 0.5
+
+      freeze_frame_aug: true
+      teleop_sample_prob_when_smpl: 0.5
+
+      motion_lib_cfg:
+        adaptive_sampling:
+          adp_samp_failure_rate_max_over_mean: 200
+        # Point to T1 motion_lib after running scripts/04_convert_to_motion_lib.py
+        motion_file: null
+        smpl_motion_file: dummy   # use "dummy" for smoke test, real SMPL for full train
+        smpl_y_up: true
+        soma_motion_file: null    # provide on CLI: data/t1_soma
+        soma_y_up: true
+        asset:
+          assetFileName: "booster_t1_29dof.xml"
+
+  # ── Termination body name overrides ───────────────────────────────────────
+  terminations:
+    ee_body_pos:
+      params:
+        body_names:
+          - "left_foot_link"
+          - "right_foot_link"
+          - "left_hand_link"
+          - "right_hand_link"
+    foot_pos_xyz:
+      params:
+        body_names:
+          - "left_foot_link"
+          - "right_foot_link"
+
+  # ── Reward body name overrides ─────────────────────────────────────────────
+  rewards:
+    feet_acc:
+      weight: -2.5e-6
+      params:
+        asset_cfg:
+          joint_names: [".*Ankle.*"]
+    anti_shake_ang_vel:
+      params:
+        body_names: ["AL6", "AR6", "H2"]
+    undesired_contacts:
+      params:
+        sensor_cfg:
+          body_names:
+            - "^(?!left_foot_link$)(?!right_foot_link$)(?!left_hand_link$)(?!right_hand_link$)(?!AL3$)(?!AR3$).+$"
+
+  # ── Event body name overrides ──────────────────────────────────────────────
+  events:
+    base_com:
+      params:
+        asset_cfg:
+          body_names: "Trunk"
+    randomize_rigid_body_mass:
+      params:
+        asset_cfg:
+          body_names: "AL6|AR6|Trunk"
+
+algo:
+  config:
+    empty_cache_every_n_ppo_epoch: -1
+    num_steps_per_env: 24
+    use_clampped_std: true
+    std_clamp_min: 0.001
+    std_clamp_max: 0.5
+    max_grad_norm: 0.1
+    actor:
+      backbone:
+        reencode_smpl_g1_recon: true
+        encoders:
+          g1:
+            inputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
+          teleop:
+            inputs:
+              - "command_multi_future_lower_body"
+              - "vr_3point_local_target"
+              - "vr_3point_local_orn_target"
+              - "motion_anchor_ori_b"
+          smpl:
+            inputs:
+              - "smpl_joints_multi_future_local_nonflat"
+              - "smpl_root_ori_b_multi_future"
+              - "joint_pos_multi_future_wrist_for_smpl"
+          soma:
+            inputs:
+              - "soma_joints_multi_future_local_nonflat"
+              - "soma_root_ori_b_multi_future"
+              - "joint_pos_multi_future_wrist_for_soma"
+        decoders:
+          g1_kin:
+            outputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
+
+    critic:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
