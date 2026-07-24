@@ -74,6 +74,50 @@ See [Data Collection](data_collection.md) for camera server setup.
 
 The `gear_sonic_deploy` binary must be built. See the main README.
 
+### Low-Latency Teleoperation Checkpoint
+
+The `low_latency/` checkpoint is configured for responsive whole-body
+teleoperation. Its SMPL encoder uses 4 future reference frames at 50 Hz
+(approximately 80 ms of reference lookahead), compared with 10 frames
+(approximately 200 ms) in the default release. This is reference lookahead,
+not total end-to-end system latency.
+
+Download the deployment files from Hugging Face:
+
+```bash
+python download_from_hf.py --low-latency
+```
+
+Then launch `gear_sonic_deploy` with the low-latency model prefix and matching
+observation config:
+
+**C++ deploy:**
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
+For simulation, replace `real` with `sim`. The `--cp` value is a model prefix:
+`deploy.sh` appends `_encoder.onnx` and `_decoder.onnx` internally.
+
+**Python launcher:**
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
+The Python launcher starts the same C++ deploy command in a tmux pane, then runs
+the Python VLA inference client, keyboard publisher, and optional data exporter.
+
 ## Action Space
 
 The Sonic embodiment (`unitree_g1_sonic`) uses a 78-dimensional action
@@ -158,6 +202,27 @@ uv run python gr00t/eval/run_gr00t_server.py \
 ```bash
 cd gear_sonic_deploy
 ./deploy.sh --input-type zmq_manager real
+```
+
+Low-latency variant:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the apple"
+```
+
+Manual C++ deploy equivalent:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
 ```
 
 ### Terminal 3 — VLA Inference
