@@ -219,3 +219,8 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+
+# Webcam teleop local assets (never version)
+external_dependencies/GENMO/
+/inputs
+.github/agents/
