@@ -84,9 +84,20 @@ python gear_sonic/scripts/teleop_webui/server.py          # http://localhost:808
 Open <http://localhost:8080> and press **START**. The orchestrator runs the
 pre-flight checks (venvs, webcam, ports, multicast route), launches the four
 components in the correct order with readiness detection, and presses `]` on
-the C++ controller for you. The page shows per-component status, GEM warmup
-progress, bridge fps, live logs, the **camera preview**, and buttons for
-E-STOP, pause, stream toggle and leftover-process cleanup.
+the C++ controller for you. Wait for all four component LEDs to turn green
+(the C++ controller takes ~30 s loading TensorRT; the GEM warmup needs your
+**full body visible** in the camera preview). The MuJoCo window is passive —
+you never type or click in it; everything is controlled from the page:
+
+| UI button | Effect |
+|---|---|
+| START | Pre-flight + launch everything + start the policy (`]`) |
+| Stop | Graceful shutdown of the whole stack |
+| E-STOP | Immediately halts control (sends `o` to the controller) |
+| Start policy ( ] ) | Re-send `]` (e.g. after a fall + re-init) |
+| Toggle stream (Enter) | If the robot stands but does not imitate you |
+| Pause/Resume (p) | Pause imitation (robot stands) / resume |
+| Cleanup | Kill leftover processes from a previous run (frees ports) |
 
 The manual procedure below remains the reference and fallback.
 
