@@ -75,6 +75,17 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
             print(f"[ZMQ] Preview JPEG on tcp://127.0.0.1:{args.preview_port}")
         print(f"[ZMQ] Publishing SMPL frames on tcp://*:{args.zmq_port}")
 
+    def _emit_preview_raw(self, frame_bgr):
+        """Publish the raw camera frame so the UI shows video before tracking starts."""
+        if self._preview_pub is None:
+            return
+        ok, jpeg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if ok:
+            try:
+                self._preview_pub.send(jpeg.tobytes(), flags=zmq.NOBLOCK)
+            except zmq.Again:
+                pass
+
     def _emit_display(self, disp) -> bool:
         """Show or publish a display frame. Returns True if the user quit."""
         if self._preview_pub is not None:
@@ -147,6 +158,9 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
                         except _queue_mod.Empty:
                             if not self._headless:
                                 cv2.waitKey(1)
+                            self._emit_preview_raw(frame_bgr)
+                    else:
+                        self._emit_preview_raw(frame_bgr)
                     print(f"\rFrame {self.frame_index}: no person detected", end="")
                     continue
 
@@ -175,6 +189,7 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
                 t = result["timing"]
 
                 if not result["ready"]:
+                    self._emit_preview_raw(frame_bgr)
                     print(f"\rWarmup {result['warmup']} | tot={t['total']*1000:.0f}ms", end="")
                     continue
 
