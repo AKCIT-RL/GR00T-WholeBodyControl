@@ -177,12 +177,24 @@ def _make_specs(mode: str, camera_id: int) -> dict[str, ComponentSpec]:
             alive_ready_secs=6.0,
             ready_timeout=30.0,
         )
+    if mode == "sim":
+        cpp_argv = [
+            "just", "run", "g1_deploy_onnx_ref", "lo",
+            "policy/release/model_decoder.onnx", "reference/example/",
+            "--obs-config", "policy/release/observation_config.yaml",
+            "--encoder-file", "policy/release/model_encoder.onnx",
+            "--planner-file", "planner/target_vel/V2/planner_sonic.onnx",
+            "--input-type", "zmq_manager", "--output-type", "all",
+            "--zmq-host", "localhost", "--disable-crc-check",
+        ]
+    else:  # deploy.sh auto-detects the robot network interface (and rebuilds)
+        cpp_argv = [f"{root}/gear_sonic_deploy/deploy.sh", "--input-type", "zmq_manager", mode]
     specs["cpp"] = ComponentSpec(
         name="cpp",
-        argv=[f"{root}/gear_sonic_deploy/deploy.sh", "--input-type", "zmq_manager", mode],
+        argv=cpp_argv,
         cwd=f"{root}/gear_sonic_deploy",
         ready_pattern=re.compile(r"Init Done"),
-        ready_timeout=300.0,
+        ready_timeout=600.0,
     )
     specs["gem"] = ComponentSpec(
         name="gem",

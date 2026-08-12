@@ -129,6 +129,11 @@ async def api_preflight(mode: str = "sim"):
     return {"checks": orch.preflight(mode)}
 
 
+@app.get("/api/status")
+async def api_status():
+    return orch.status()
+
+
 @app.websocket("/ws")
 async def ws_status(ws: WebSocket):
     await ws.accept()
