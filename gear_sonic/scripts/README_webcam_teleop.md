@@ -72,7 +72,27 @@ sudo ip route add 224.0.0.0/4 dev lo
 
 ---
 
-## 2. Running (4 terminals)
+## 2. Running — Web UI (one button)
+
+```bash
+cd ~/Documentos/GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/teleop_webui/server.py          # http://localhost:8080
+# add --host 0.0.0.0 to open the UI from a tablet/phone on the same network
+```
+
+Open <http://localhost:8080> and press **START**. The orchestrator runs the
+pre-flight checks (venvs, webcam, ports, multicast route), launches the four
+components in the correct order with readiness detection, and presses `]` on
+the C++ controller for you. The page shows per-component status, GEM warmup
+progress, bridge fps, live logs, the **camera preview**, and buttons for
+E-STOP, pause, stream toggle and leftover-process cleanup.
+
+The manual procedure below remains the reference and fallback.
+
+---
+
+## 3. Running manually (4 terminals)
 
 > Alternatively, `bash gear_sonic/scripts/launch_webcam_teleop.sh sim` starts all
 > four panes in one tmux session. The manual procedure below is the reference.
