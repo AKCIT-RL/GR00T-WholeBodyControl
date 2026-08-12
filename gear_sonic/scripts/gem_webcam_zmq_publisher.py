@@ -65,7 +65,30 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
         self._zmq_pub.bind(f"tcp://*:{args.zmq_port}")
         self._pub_count = 0
         self._last_pub_t = None
+        self._headless = bool(getattr(args, "headless", False))
+        self._preview_pub = None
+        if getattr(args, "preview_port", 0):
+            self._preview_pub = self._zmq_ctx.socket(zmq.PUB)
+            self._preview_pub.setsockopt(zmq.SNDHWM, 1)
+            self._preview_pub.setsockopt(zmq.LINGER, 0)
+            self._preview_pub.bind(f"tcp://127.0.0.1:{args.preview_port}")
+            print(f"[ZMQ] Preview JPEG on tcp://127.0.0.1:{args.preview_port}")
         print(f"[ZMQ] Publishing SMPL frames on tcp://*:{args.zmq_port}")
+
+    def _emit_display(self, disp) -> bool:
+        """Show or publish a display frame. Returns True if the user quit."""
+        if self._preview_pub is not None:
+            ok, jpeg = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                try:
+                    self._preview_pub.send(jpeg.tobytes(), flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
+        if not self._headless:
+            cv2.imshow("GEM-SMPL Webcam", disp)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                return True
+        return False
 
     def _publish(self, result, avg_fps: float):
         incam = result["body_params_incam"]
@@ -119,11 +142,11 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
                     if self._display_queue is not None:
                         try:
                             disp = self._display_queue.get_nowait()
-                            cv2.imshow("GEM-SMPL Webcam", disp)
-                            if cv2.waitKey(1) & 0xFF == ord("q"):
+                            if self._emit_display(disp):
                                 break
                         except _queue_mod.Empty:
-                            cv2.waitKey(1)
+                            if not self._headless:
+                                cv2.waitKey(1)
                     print(f"\rFrame {self.frame_index}: no person detected", end="")
                     continue
 
@@ -144,8 +167,7 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
                 if self._display_queue is not None:
                     try:
                         disp = self._display_queue.get_nowait()
-                        cv2.imshow("GEM-SMPL Webcam", disp)
-                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                        if self._emit_display(disp):
                             break
                     except _queue_mod.Empty:
                         pass
@@ -183,8 +205,10 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
                 self._render_proc.join(timeout=3)
                 if self._render_proc.is_alive():
                     self._render_proc.terminate()
-            if self._display_queue is not None:
+            if self._display_queue is not None and not self._headless:
                 cv2.destroyAllWindows()
+            if self._preview_pub is not None:
+                self._preview_pub.close(0)
             self._zmq_pub.close(0)
             print()
             _dw.Log.info(f"[Done] {n_frames} frames | {self._pub_count} published via ZMQ")
@@ -210,6 +234,14 @@ def parse_args():
         "--render_mode", type=str, default="opencv", choices=["viser", "opencv"],
     )
     parser.add_argument("--render_port", type=int, default=8012)
+    parser.add_argument(
+        "--preview_port", type=int, default=0,
+        help="If set, publish rendered frames as JPEG on this ZMQ PUB port (for the web UI)",
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="No OpenCV window (use with --preview_port)",
+    )
     parser.add_argument("--async_pipeline", action="store_true", default=True)
     parser.add_argument("--no_async_pipeline", action="store_true")
     return parser.parse_args()
