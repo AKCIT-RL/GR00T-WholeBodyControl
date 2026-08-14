@@ -71,6 +71,14 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
         self._pub_count = 0
         self._last_pub_t = None
         self._headless = bool(getattr(args, "headless", False))
+        # Video files are decoded as fast as inference allows; pace to source fps
+        # so the bridge sees a realtime stream like the webcam.
+        self._video_dt = 0.0
+        if getattr(args, "video", None):
+            src_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if src_fps > 0:
+                self._video_dt = 1.0 / src_fps
+                print(f"[ZMQ] Video input paced at {src_fps:.1f} fps")
         self._preview_pub = None
         if getattr(args, "preview_port", 0):
             self._preview_pub = self._zmq_ctx.socket(zmq.PUB)
@@ -161,9 +169,15 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
 
         fps_history = deque(maxlen=60)
         n_frames = 0
+        next_frame_t = time.monotonic()
 
         try:
             while True:
+                if self._video_dt:
+                    next_frame_t += self._video_dt
+                    delay = next_frame_t - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
                 ok, frame_bgr = self.cap.read()
                 if not ok:
                     break
