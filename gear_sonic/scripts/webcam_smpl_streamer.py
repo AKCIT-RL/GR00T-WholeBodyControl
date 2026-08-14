@@ -12,10 +12,18 @@ Pipeline:
     --ZMQ 5556-->  C++ SONIC controller (sim or real G1)
 
 Keyboard controls (this terminal):
-    s : START streaming in POSE mode (robot imitates your motion)
-    p : toggle POSE <-> PLANNER-IDLE (pause imitation, robot stands)
+    s : ARM streaming (robot resumes imitation after a short dwell + ramp)
+    p : PAUSE (disarm; robot blends to neutral pose and idles)
+    n : NEXT PILOT (same as pause; press 's' when the next person is ready)
     o : STOP control and exit
     q : same as 'o'
+
+Safety layer (see teleop_safety.py):
+    - per-tick joint velocity clamp on everything streamed;
+    - invalid/lost tracking: freeze (HOLD) -> blend to neutral -> PLANNER-IDLE;
+    - resume requires ~1 s of continuous valid tracking + 1 s ramp;
+    - --upper_body: only arms/torso are imitated (legs + pelvis stay neutral);
+    - session timer (--session_timeout) forces idle and requires re-arming.
 
 Run (inside .venv_teleop, from repo root):
     python gear_sonic/scripts/webcam_smpl_streamer.py
@@ -43,6 +51,16 @@ from scipy.spatial.transform import Rotation as R
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from teleop_safety import (  # noqa: E402
+    SafetyLimits,
+    SafetyStateMachine,
+    pose_is_sane,
+    sample_is_jump,
+    zero_legs_smpl,
+)
 
 from gear_sonic.isaac_utils.rotations import (  # noqa: E402
     remove_smpl_base_rot,
@@ -223,18 +241,24 @@ class GemReceiver:
     (GEM runs at ~15-30 fps; the controller consumes 50 Hz).
     """
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, limits: SafetyLimits, upper_body: bool = False):
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.SUB)
         self._sock.setsockopt(zmq.SUBSCRIBE, b"")
         self._sock.setsockopt(zmq.CONFLATE, 1)
         self._sock.setsockopt(zmq.LINGER, 0)
         self._sock.connect(f"tcp://{host}:{port}")
+        self._limits = limits
+        self._upper_body = upper_body
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._prev: dict | None = None
         self._curr: dict | None = None
+        self._last_received: dict | None = None  # jump reference (even if rejected)
         self._n_received = 0
+        self._n_rejected = 0
+        self._last_reject_reason = ""
+        self._last_msg_ns = 0  # any message (incl. heartbeats) = GEM alive
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -248,6 +272,18 @@ class GemReceiver:
     @property
     def n_received(self) -> int:
         return self._n_received
+
+    @property
+    def n_rejected(self) -> int:
+        return self._n_rejected
+
+    @property
+    def last_reject_reason(self) -> str:
+        return self._last_reject_reason
+
+    @property
+    def last_msg_ns(self) -> int:
+        return self._last_msg_ns
 
     def _run(self):
         poller = zmq.Poller()
@@ -269,19 +305,29 @@ class GemReceiver:
                 self._n_received += 1
 
     def _process(self, sample: dict) -> dict | None:
+        self._last_msg_ns = time.monotonic_ns()
+        if not sample.get("tracking_valid", True):
+            # GEM heartbeat: alive but no usable pose (warmup / no person / gating)
+            self._last_reject_reason = str(sample.get("reason", "tracking_invalid"))
+            return None
         try:
-            body_pose = torch.from_numpy(
-                np.asarray(sample["body_pose"], dtype=np.float32)
-            ).reshape(1, -1)
-            global_orient = torch.from_numpy(
-                np.asarray(sample["global_orient"], dtype=np.float32)
-            ).reshape(1, 3)
+            body_pose_raw = np.asarray(sample["body_pose"], dtype=np.float32).reshape(-1)
+            global_orient_raw = np.asarray(
+                sample["global_orient"], dtype=np.float32
+            ).reshape(-1)
         except (KeyError, ValueError) as e:
             print(f"[Bridge] Bad GEM sample: {e}")
             return None
 
+        if self._upper_body:
+            body_pose_raw = zero_legs_smpl(body_pose_raw)
+            global_orient_raw = np.zeros(3, dtype=np.float32)
+
+        body_pose = torch.from_numpy(body_pose_raw).reshape(1, -1)
+        global_orient = torch.from_numpy(global_orient_raw).reshape(1, 3)
+
         out = process_smpl_joints(body_pose, global_orient)
-        return {
+        processed = {
             "timestamp_ns": int(sample.get("timestamp_ns", time.monotonic_ns())),
             "timestamp_realtime": float(sample.get("timestamp_realtime", time.time())),
             "dt": float(sample.get("dt", 0.0)),
@@ -292,6 +338,29 @@ class GemReceiver:
             "smpl_joints_np": out["smpl_joints_local"].numpy()[0].astype(np.float32),
             "body_quat_np": out["global_orient_quat"].numpy()[0].astype(np.float32),
         }
+
+        # --- Safety validation (see teleop_safety) ---
+        ok, reason = pose_is_sane(
+            processed["smpl_pose_np"], processed["body_quat_np"], self._limits
+        )
+        if ok and self._last_received is not None:
+            is_jump, jump_reason = sample_is_jump(
+                self._last_received["smpl_pose_np"],
+                processed["smpl_pose_np"],
+                self._last_received["body_quat_np"],
+                processed["body_quat_np"],
+                self._limits,
+            )
+            if is_jump:
+                ok, reason = False, jump_reason
+        # Jump reference tracks the last *received* sample so a genuinely new,
+        # stable pose becomes valid again on the following frame.
+        self._last_received = processed
+        if not ok:
+            self._n_rejected += 1
+            self._last_reject_reason = reason
+            return None
+        return processed
 
     def get_pair(self) -> tuple[dict | None, dict | None]:
         with self._lock:
@@ -325,53 +394,107 @@ class KeyboardListener:
 # ---------------------------------------------------------------------------
 
 
+def build_neutral_frame() -> dict:
+    """Neutral standing frame (A-pose, arms lowered) used as the idle target."""
+    body_pose = np.zeros(63, dtype=np.float32)
+    body_pose[15 * 3 + 2] = -1.0  # left shoulder: lower arm from T-pose
+    body_pose[16 * 3 + 2] = 1.0  # right shoulder
+    out = process_smpl_joints(
+        torch.from_numpy(body_pose).reshape(1, -1),
+        torch.zeros(1, 3, dtype=torch.float32),
+    )
+    smpl_pose = out["smpl_pose"].numpy()[:, :63].reshape(21, 3).astype(np.float32)
+    return {
+        "smpl_pose": smpl_pose,
+        "smpl_joints": out["smpl_joints_local"].numpy()[0].astype(np.float32),
+        "body_quat": out["global_orient_quat"].numpy()[0].astype(np.float32),
+        "joint_pos": compute_g1_wrist_joint_pos(smpl_pose),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="GEM webcam -> SONIC pose bridge")
     parser.add_argument("--gem_host", type=str, default="localhost", help="GEM publisher host")
     parser.add_argument("--gem_port", type=int, default=5558, help="GEM publisher port")
     parser.add_argument("--port", type=int, default=5556, help="SONIC ZMQ PUB port")
+    parser.add_argument(
+        "--bind_host", type=str, default="127.0.0.1",
+        help="Interface to bind the SONIC PUB socket (default: localhost only)",
+    )
     parser.add_argument("--target_fps", type=int, default=50, help="Output rate (Hz)")
     parser.add_argument(
         "--num_frames_to_send", type=int, default=5, help="Frames per pose message"
     )
     parser.add_argument(
-        "--record_dir", type=str, default="", help="Save sent batches as npz (default: off)"
+        "--record_dir", type=str, default=None,
+        help="Save sent batches as npz (default: teleop_recordings/<timestamp>)",
+    )
+    parser.add_argument(
+        "--no_record", action="store_true", help="Disable recording of sent batches"
     )
     parser.add_argument(
         "--auto_start",
         action="store_true",
-        help="Send START (pose mode) automatically once GEM frames arrive",
+        help="Arm streaming automatically once GEM frames arrive",
+    )
+    parser.add_argument(
+        "--upper_body",
+        action="store_true",
+        help="Upper body mode: only arms/torso are imitated; legs and pelvis stay neutral",
+    )
+    parser.add_argument(
+        "--session_timeout", type=float, default=None,
+        help="Force idle after this many seconds of session (default: 90 in "
+        "--upper_body mode, disabled otherwise; 0 disables)",
     )
     args = parser.parse_args()
 
-    if args.record_dir:
-        os.makedirs(args.record_dir, exist_ok=True)
+    session_timeout = args.session_timeout
+    if session_timeout is None:
+        session_timeout = 90.0 if args.upper_body else 0.0
+
+    record_dir = None
+    if not args.no_record:
+        record_dir = args.record_dir or str(
+            REPO_ROOT / "teleop_recordings" / time.strftime("%Y%m%d_%H%M%S")
+        )
+        os.makedirs(record_dir, exist_ok=True)
+        print(f"[Bridge] Recording sent batches to {record_dir}")
+
+    limits = SafetyLimits()
+    neutral_frame = build_neutral_frame()
+    machine = SafetyStateMachine(limits=limits, neutral_frame=neutral_frame)
 
     ctx = zmq.Context.instance()
     pub = ctx.socket(zmq.PUB)
-    pub.bind(f"tcp://*:{args.port}")
+    pub.bind(f"tcp://{args.bind_host}:{args.port}")
     time.sleep(0.2)
-    print(f"[Bridge] SONIC PUB bound to tcp://*:{args.port}")
+    print(f"[Bridge] SONIC PUB bound to tcp://{args.bind_host}:{args.port}")
 
-    receiver = GemReceiver(args.gem_host, args.gem_port)
+    receiver = GemReceiver(args.gem_host, args.gem_port, limits, args.upper_body)
     receiver.start()
     print(f"[Bridge] Listening for GEM frames on tcp://{args.gem_host}:{args.gem_port}")
+    if args.upper_body:
+        print("[Bridge] UPPER BODY mode: legs/pelvis stay neutral, session "
+              f"timeout={session_timeout:.0f}s")
     print(
-        "[Bridge] Keys: [s]=START pose mode  [p]=toggle POSE/PLANNER-IDLE  "
-        "[o]/[q]=STOP+exit"
+        "[Bridge] Keys: [s]=ARM  [p]=PAUSE  [n]=NEXT PILOT  [o]/[q]=STOP+exit"
     )
 
-    mode = StreamMode.OFF
+    started = False  # becomes True on first arm; before that nothing is sent
+    wire_mode: str | None = None  # "pose" | "planner"
+    session_armed_t = 0.0
     frame_buffer: dict[str, deque] = defaultdict(lambda: deque(maxlen=args.num_frames_to_send))
     buffer_cleared = True
     step = 0
     record_idx = 0
     frame_time = 1.0 / args.target_fps
+    watchdog_ns = int(limits.watchdog_s * 1e9)
     left_hand_joints = np.zeros((1, 7), dtype=np.float32)
     right_hand_joints = np.zeros((1, 7), dtype=np.float32)
     fps_counter = 0
     last_fps_report = time.time()
-    warned_no_gem = False
+    last_state = machine.state
 
     kb = KeyboardListener()
 
@@ -389,131 +512,183 @@ def main():
         elif new_mode == StreamMode.OFF:
             pub.send(build_command_message(start=False, stop=True, planner=True))
 
+    def arm(reason: str):
+        nonlocal started, session_armed_t
+        started = True
+        session_armed_t = time.monotonic()
+        machine.arm(time.monotonic())
+        print(f"[Bridge] ARMED ({reason}) — robot will resume after ~"
+              f"{limits.resume_dwell_s:.0f}s of valid tracking")
+
     try:
         frame_start = time.time()
         while True:
+            now = time.monotonic()
+
             # --- Keyboard ---
             key = kb.get_key()
             if key in ("o", "q", "\x03"):
                 print("\n[Bridge] STOP requested")
                 send_command(StreamMode.OFF)
                 break
-            elif key == "s" and mode == StreamMode.OFF:
-                if receiver.n_received == 0:
-                    print("[Bridge] No GEM frames yet — wait for the webcam warmup.")
-                else:
-                    mode = StreamMode.POSE
-                    clear_buffer()
-                    print("[Bridge] -> POSE mode (robot imitates you). Command will be sent.")
-            elif key == "p" and mode != StreamMode.OFF:
-                if mode == StreamMode.POSE:
-                    mode = StreamMode.PLANNER_IDLE
-                    send_command(mode)
-                    print("[Bridge] -> PLANNER-IDLE (imitation paused, robot stands)")
-                else:
-                    mode = StreamMode.POSE
-                    clear_buffer()
-                    print("[Bridge] -> POSE mode (imitation resumed)")
+            elif key == "s":
+                if not machine.armed:
+                    arm("key s")
+            elif key == "p" and started:
+                if machine.armed:
+                    machine.force_idle(now, "paused")
+                    print("[Bridge] PAUSED — blending to neutral, then idle. "
+                          "[s] to resume.")
+            elif key == "n" and started:
+                machine.force_idle(now, "next_pilot")
+                print("[Bridge] NEXT PILOT — blending to neutral. Press [s] when "
+                      "the next person is in position.")
 
-            if args.auto_start and mode == StreamMode.OFF and receiver.n_received > 0:
-                mode = StreamMode.POSE
-                clear_buffer()
-                print("[Bridge] auto_start: -> POSE mode")
+            if args.auto_start and not started and receiver.n_received > 0:
+                arm("auto_start")
 
-            if mode == StreamMode.PLANNER_IDLE:
+            if not started:
+                time.sleep(frame_time)
+                frame_start = time.time()
+                continue
+
+            # --- Session timer ---
+            if (
+                session_timeout > 0
+                and machine.armed
+                and now - session_armed_t > session_timeout
+            ):
+                machine.force_idle(now, "session_timeout")
+                print(f"[Bridge] SESSION TIMEOUT ({session_timeout:.0f}s) — "
+                      "blending to neutral. Press [s] for the next session.")
+
+            # --- Compute live frame (interpolated, only if fresh + valid) ---
+            live = None
+            prev, curr = receiver.get_pair()
+            now_ns = time.monotonic_ns()
+            if (
+                curr is not None
+                and prev is not None
+                and curr["timestamp_ns"] > prev["timestamp_ns"]
+                and (now_ns - curr["timestamp_ns"]) <= watchdog_ns
+            ):
+                src_interval = curr["timestamp_ns"] - prev["timestamp_ns"]
+                playback_ns = now_ns - src_interval
+                alpha = (playback_ns - prev["timestamp_ns"]) / float(src_interval)
+                alpha = min(max(alpha, 0.0), 1.0)
+
+                use_pose = _interp_pose_axis_angle(
+                    prev["smpl_pose_np"], curr["smpl_pose_np"], alpha
+                ).astype(np.float32)
+                use_joints = (
+                    (1.0 - alpha) * prev["smpl_joints_np"] + alpha * curr["smpl_joints_np"]
+                ).astype(np.float32)
+                use_body_quat = _quat_lerp_normalized(
+                    prev["body_quat_np"], curr["body_quat_np"], alpha
+                ).astype(np.float32)
+                live = {
+                    "smpl_pose": use_pose,
+                    "smpl_joints": use_joints,
+                    "body_quat": use_body_quat,
+                    "joint_pos": compute_g1_wrist_joint_pos(use_pose),
+                }
+
+            # --- Safety state machine ---
+            out = machine.tick(now, live)
+            if out.state != last_state:
+                print(f"[Bridge] safety: {last_state.name} -> {out.state.name} "
+                      f"({out.reason})")
+                last_state = out.state
+
+            if out.frame is None:
+                # IDLE: robot stands via the planner
+                if wire_mode != "planner":
+                    wire_mode = "planner"
+                    send_command(StreamMode.PLANNER_IDLE)
                 pub.send(
                     build_planner_message(0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], -1.0, -1.0)
                 )
+                fps_counter += 1
+            else:
+                if wire_mode != "pose":
+                    wire_mode = "pose"
+                    clear_buffer()
 
-            elif mode == StreamMode.POSE:
-                prev, curr = receiver.get_pair()
-                if curr is None:
-                    if not warned_no_gem:
-                        print("[Bridge] Waiting for GEM frames...")
-                        warned_no_gem = True
-                elif prev is None or curr["timestamp_ns"] <= prev["timestamp_ns"]:
-                    pass  # need two distinct frames to interpolate
-                else:
-                    # Playback delayed by one source interval for smooth interpolation
-                    src_interval = curr["timestamp_ns"] - prev["timestamp_ns"]
-                    playback_ns = time.monotonic_ns() - src_interval
-                    alpha = (playback_ns - prev["timestamp_ns"]) / float(src_interval)
-                    alpha = min(max(alpha, 0.0), 1.0)
+                frame_buffer["smpl_pose"].append(out.frame["smpl_pose"])
+                frame_buffer["smpl_joints"].append(out.frame["smpl_joints"])
+                frame_buffer["body_quat_w"].append(out.frame["body_quat"])
+                frame_buffer["frame_index"].append(int(step))
+                frame_buffer["joint_pos"].append(out.frame["joint_pos"])
 
-                    use_pose = _interp_pose_axis_angle(
-                        prev["smpl_pose_np"], curr["smpl_pose_np"], alpha
-                    ).astype(np.float32)
-                    use_joints = (
-                        (1.0 - alpha) * prev["smpl_joints_np"] + alpha * curr["smpl_joints_np"]
-                    ).astype(np.float32)
-                    use_body_quat = _quat_lerp_normalized(
-                        prev["body_quat_np"], curr["body_quat_np"], alpha
-                    ).astype(np.float32)
+                N = len(frame_buffer["frame_index"])
+                buffer_is_full = N >= args.num_frames_to_send
+                if buffer_is_full and buffer_cleared:
+                    buffer_cleared = False
+                    send_command(StreamMode.POSE)
+                    print("[Bridge] Buffer full — streaming pose + START command sent")
 
-                    joint_pos = compute_g1_wrist_joint_pos(use_pose)
+                if buffer_is_full and not buffer_cleared:
+                    src = curr if curr is not None else {}
+                    numpy_data = {
+                        "smpl_pose": np.stack(frame_buffer["smpl_pose"], axis=0),
+                        "smpl_joints": np.stack(frame_buffer["smpl_joints"], axis=0),
+                        "body_quat_w": np.stack(frame_buffer["body_quat_w"], axis=0),
+                        "joint_pos": np.stack(frame_buffer["joint_pos"], axis=0),
+                        "joint_vel": np.zeros((N, 29)),
+                        "frame_index": np.array(
+                            frame_buffer["frame_index"], dtype=np.int64
+                        ),
+                        "left_trigger": np.array([0.0], dtype=np.float32),
+                        "right_trigger": np.array([0.0], dtype=np.float32),
+                        "left_grip": np.array([0.0], dtype=np.float32),
+                        "right_grip": np.array([0.0], dtype=np.float32),
+                        "pico_dt": np.array(
+                            [float(src.get("dt", 0.0))], dtype=np.float32
+                        ),
+                        "pico_fps": np.array(
+                            [float(src.get("fps", 0.0))], dtype=np.float32
+                        ),
+                        "timestamp_realtime": np.array(
+                            [float(src.get("timestamp_realtime", time.time()))],
+                            dtype=np.float64,
+                        ),
+                        "timestamp_monotonic": np.array(
+                            [float(src.get("timestamp_ns", now_ns)) * 1e-9],
+                            dtype=np.float64,
+                        ),
+                        "left_hand_joints": left_hand_joints.reshape(-1),
+                        "right_hand_joints": right_hand_joints.reshape(-1),
+                        "toggle_data_collection": np.array([False], dtype=bool),
+                        "toggle_data_abort": np.array([False], dtype=bool),
+                        "heading_increment": np.array([0.0], dtype=np.float32),
+                    }
+                    pub.send(pack_pose_message(numpy_data, topic="pose"))
 
-                    frame_buffer["smpl_pose"].append(use_pose)
-                    frame_buffer["smpl_joints"].append(use_joints)
-                    frame_buffer["body_quat_w"].append(use_body_quat)
-                    frame_buffer["frame_index"].append(int(step))
-                    frame_buffer["joint_pos"].append(joint_pos)
+                    if record_dir:
+                        out_path = os.path.join(
+                            record_dir, f"pose_{record_idx:06d}.npz"
+                        )
+                        np.savez_compressed(out_path, **numpy_data)
+                        record_idx += 1
 
-                    N = len(frame_buffer["frame_index"])
-                    buffer_is_full = N >= args.num_frames_to_send
-                    if buffer_is_full and buffer_cleared:
-                        buffer_cleared = False
-                        send_command(StreamMode.POSE)
-                        print("[Bridge] Buffer full — streaming pose + START command sent")
+                step += 1
+                fps_counter += 1
 
-                    if buffer_is_full and not buffer_cleared:
-                        numpy_data = {
-                            "smpl_pose": np.stack(frame_buffer["smpl_pose"], axis=0),
-                            "smpl_joints": np.stack(frame_buffer["smpl_joints"], axis=0),
-                            "body_quat_w": np.stack(frame_buffer["body_quat_w"], axis=0),
-                            "joint_pos": np.stack(frame_buffer["joint_pos"], axis=0),
-                            "joint_vel": np.zeros((N, 29)),
-                            "frame_index": np.array(
-                                frame_buffer["frame_index"], dtype=np.int64
-                            ),
-                            "left_trigger": np.array([0.0], dtype=np.float32),
-                            "right_trigger": np.array([0.0], dtype=np.float32),
-                            "left_grip": np.array([0.0], dtype=np.float32),
-                            "right_grip": np.array([0.0], dtype=np.float32),
-                            "pico_dt": np.array([curr["dt"]], dtype=np.float32),
-                            "pico_fps": np.array([curr["fps"]], dtype=np.float32),
-                            "timestamp_realtime": np.array(
-                                [curr["timestamp_realtime"]], dtype=np.float64
-                            ),
-                            "timestamp_monotonic": np.array(
-                                [curr["timestamp_ns"] * 1e-9], dtype=np.float64
-                            ),
-                            "left_hand_joints": left_hand_joints.reshape(-1),
-                            "right_hand_joints": right_hand_joints.reshape(-1),
-                            "toggle_data_collection": np.array([False], dtype=bool),
-                            "toggle_data_abort": np.array([False], dtype=bool),
-                            "heading_increment": np.array([0.0], dtype=np.float32),
-                        }
-                        pub.send(pack_pose_message(numpy_data, topic="pose"))
-
-                        if args.record_dir:
-                            out_path = os.path.join(
-                                args.record_dir, f"pose_{record_idx:06d}.npz"
-                            )
-                            np.savez_compressed(out_path, **numpy_data)
-                            record_idx += 1
-
-                    step += 1
-                    fps_counter += 1
-
-            now = time.time()
-            if now - last_fps_report >= 5.0:
-                fps = fps_counter / (now - last_fps_report)
+            now_wall = time.time()
+            if now_wall - last_fps_report >= 5.0:
+                fps = fps_counter / (now_wall - last_fps_report)
                 print(
-                    f"[Bridge] mode={mode.name} out_fps={fps:.1f} "
-                    f"gem_frames={receiver.n_received} step={step}"
+                    f"[Bridge] mode={out.state.name} out_fps={fps:.1f} "
+                    f"gem_frames={receiver.n_received} step={step} "
+                    f"rejected={receiver.n_rejected}"
+                    + (
+                        f" last_reject={receiver.last_reject_reason}"
+                        if receiver.last_reject_reason
+                        else ""
+                    )
                 )
                 fps_counter = 0
-                last_fps_report = now
+                last_fps_report = now_wall
 
             elapsed = time.time() - frame_start
             if elapsed < frame_time:
