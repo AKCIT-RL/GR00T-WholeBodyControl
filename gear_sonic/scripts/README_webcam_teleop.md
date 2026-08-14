@@ -96,8 +96,12 @@ you never type or click in it; everything is controlled from the page:
 | E-STOP | Immediately halts control (sends `o` to the controller) |
 | Start policy ( ] ) | Re-send `]` (e.g. after a fall + re-init) |
 | Toggle stream (Enter) | If the robot stands but does not imitate you |
-| Pause/Resume (p) | Pause imitation (robot stands) / resume |
+| Arm (s) / Pause (p) | Resume / pause imitation (robot idles standing) |
+| Next pilot (n) | Pause + reset the session timer for the next person |
 | Cleanup | Kill leftover processes from a previous run (frees ports) |
+
+The **Upper body mode** checkbox (default on) restricts imitation to arms and
+torso — legs and root orientation stay neutral. Recommended for public demos.
 
 The manual procedure below remains the reference and fallback.
 
@@ -167,14 +171,26 @@ python gear_sonic/scripts/webcam_smpl_streamer.py --auto_start
 followed by periodic lines like:
 
 ```
-[Bridge] mode=POSE out_fps=49.8 gem_frames=1234 step=5678
+[Bridge] mode=TRACKING out_fps=49.8 gem_frames=1234 step=5678 rejected=0
 ```
 
 `out_fps` must be ~49.8 and `gem_frames` must keep increasing. If `gem_frames`
 stays at 0, GEM is not detecting you — go back in front of the camera.
 
 Without `--auto_start`, press `s` in this terminal to begin streaming.
-Other bridge keys: `p` = pause/resume (planner idle), `o`/`q` = stop and exit.
+Other bridge keys: `p` = pause (safety idle; press `s` to resume), `n` = next
+pilot (pause + reset session timer), `o`/`q` = stop and exit.
+
+Useful flags: `--upper_body` (arms/torso only — legs and root orientation are
+forced neutral; recommended for public demos; enables a 90 s session timer,
+configurable with `--session_timeout`), `--record_dir DIR` / `--no_record`.
+
+A safety state machine sits between GEM and the robot: per-tick clamps on
+joint/pose/quaternion deltas, sanity + jump rejection of GEM samples, and a
+watchdog. If tracking is lost (pilot leaves the frame, occlusion, GEM crash)
+the bridge holds the last pose, blends to a neutral stance, and switches the
+robot to planner idle; when tracking returns it resumes with a smooth ramp.
+All of this is automatic — no key presses needed.
 
 ### Final step — start the policy (critical!)
 
@@ -189,7 +205,7 @@ Click on **Terminal 2 (C++)** and press:
 | `f` | Print motor temperatures (real robot). |
 
 **Summary:** T1 → T2 (wait `Init Done`) → T3 (wait warmup, full body in frame) →
-T4 (wait `mode=POSE`) → focus T2 → press `]` → (if not imitating) press `Enter`.
+T4 (wait `mode=TRACKING`) → focus T2 → press `]` → (if not imitating) press `Enter`.
 The robot in MuJoCo should now mirror your movements. Start with slow arm motions.
 
 ---
