@@ -63,6 +63,16 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
 
     def __init__(self, args):
         super().__init__(args)
+        # Phone videos store landscape pixels + a rotation tag that cv2 ignores
+        # by default; enable auto-rotation and fix the derived intrinsics.
+        if getattr(args, "video", None):
+            meta_rot = self.cap.get(cv2.CAP_PROP_ORIENTATION_META)
+            if meta_rot and self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1):
+                if abs(meta_rot) % 180 == 90:
+                    self.width, self.height = self.height, self.width
+                    self.K_fullimg = _dw.estimate_K(self.width, self.height)
+                    self._K_fullimg_cpu = self.K_fullimg.cpu()
+                print(f"[ZMQ] Applied video rotation metadata ({meta_rot:.0f} deg)")
         self._zmq_ctx = zmq.Context.instance()
         self._zmq_pub = self._zmq_ctx.socket(zmq.PUB)
         self._zmq_pub.setsockopt(zmq.SNDHWM, 3)
