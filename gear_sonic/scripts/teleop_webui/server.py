@@ -94,10 +94,10 @@ async def preview():
 
 
 @app.post("/api/start")
-async def api_start(mode: str = "sim", camera_id: int = 0):
+async def api_start(mode: str = "sim", camera_id: int = 0, upper_body: bool = False):
     if mode not in ("sim", "real"):
         return JSONResponse({"ok": False, "error": "mode must be sim|real"}, status_code=400)
-    ok = orch.start(mode=mode, camera_id=camera_id)
+    ok = orch.start(mode=mode, camera_id=camera_id, upper_body=upper_body)
     return {"ok": ok}
 
 

@@ -32,7 +32,7 @@ CHECK_PORTS = (5556, 5557, 5558, PREVIEW_PORT)
 KEY_MAP = {"enter": "\r", "]": "]", "o": "o", "i": "i", "f": "f", "s": "s", "p": "p"}
 ALLOWED_KEYS = {
     "cpp": {"]", "enter", "o", "i", "f"},
-    "bridge": {"s", "p", "o"},
+    "bridge": {"s", "p", "n", "o"},
 }
 
 
@@ -166,7 +166,7 @@ class Component:
         }
 
 
-def _make_specs(mode: str, camera_id: int) -> dict[str, ComponentSpec]:
+def _make_specs(mode: str, camera_id: int, upper_body: bool = False) -> dict[str, ComponentSpec]:
     root = str(REPO_ROOT)
     specs = {}
     if mode == "sim":
@@ -214,12 +214,15 @@ def _make_specs(mode: str, camera_id: int) -> dict[str, ComponentSpec]:
             (re.compile(r"(?P<no_person>no person detected)"), "gem_"),
         ],
     )
+    bridge_argv = [
+        f"{root}/.venv_teleop/bin/python",
+        "gear_sonic/scripts/webcam_smpl_streamer.py", "--auto_start",
+    ]
+    if upper_body:
+        bridge_argv.append("--upper_body")
     specs["bridge"] = ComponentSpec(
         name="bridge",
-        argv=[
-            f"{root}/.venv_teleop/bin/python",
-            "gear_sonic/scripts/webcam_smpl_streamer.py", "--auto_start",
-        ],
+        argv=bridge_argv,
         cwd=root,
         ready_pattern=re.compile(r"Buffer full"),
         ready_timeout=600.0,  # includes GEM warmup + waiting for a person
@@ -316,7 +319,7 @@ class Orchestrator:
             return None
 
     # ------------------------------------------------------------------ lifecycle
-    def start(self, mode: str = "sim", camera_id: int = 0) -> bool:
+    def start(self, mode: str = "sim", camera_id: int = 0, upper_body: bool = False) -> bool:
         with self._lock:
             if self.global_state in ("starting", "running", "stopping"):
                 return False
@@ -324,12 +327,12 @@ class Orchestrator:
             self.global_state = "preflight"
             self.detail = ""
             self._worker = threading.Thread(
-                target=self._start_sequence, args=(mode, camera_id), daemon=True
+                target=self._start_sequence, args=(mode, camera_id, upper_body), daemon=True
             )
             self._worker.start()
             return True
 
-    def _start_sequence(self, mode: str, camera_id: int):
+    def _start_sequence(self, mode: str, camera_id: int, upper_body: bool = False):
         checks = self.preflight(mode)
         hard_fail = [c for c in checks if c["hard"] and not c["ok"]]
         if hard_fail:
@@ -339,7 +342,7 @@ class Orchestrator:
 
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
-        specs = _make_specs(mode, camera_id)
+        specs = _make_specs(mode, camera_id, upper_body)
         self.components = {name: Component(spec) for name, spec in specs.items()}
         self.global_state = "starting"
 

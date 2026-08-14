@@ -64,6 +64,9 @@
         <option value="sim" selected>Simulation</option>
         <option value="real">Real robot</option>
       </select>
+      <label class="dim" style="cursor:pointer" title="Only arms/torso are imitated; legs and pelvis stay neutral. 90 s session timer.">
+        <input type="checkbox" id="upperbody" checked> Upper body mode
+      </label>
       <button id="cleanup" class="btn-small" title="Kill leftover processes / free ports">Cleanup</button>
     </div>
     <div id="detail" class="dim"></div>
@@ -83,7 +86,9 @@
         <div class="row" style="margin-top:12px">
           <button class="btn-small" onclick="sendKey('cpp',']')">Start policy ( ] )</button>
           <button class="btn-small" onclick="sendKey('cpp','enter')">Toggle stream (Enter)</button>
-          <button class="btn-small" onclick="sendKey('bridge','p')">Pause/Resume (p)</button>
+          <button class="btn-small" onclick="sendKey('bridge','s')">Arm (s)</button>
+          <button class="btn-small" onclick="sendKey('bridge','p')">Pause (p)</button>
+          <button class="btn-small" onclick="sendKey('bridge','n')">Next pilot (n)</button>
         </div>
       </div>
       <div class="card">
@@ -111,7 +116,7 @@ function api(path, opts) { return fetch(path, Object.assign({method:"POST"}, opt
 $("start").onclick = () => {
   const mode = $("mode").value;
   if (mode === "real" && !confirm("REAL ROBOT mode. Sim validated? Gantry + e-stop operator ready?")) return;
-  api(`/api/start?mode=${mode}`);
+  api(`/api/start?mode=${mode}&upper_body=${$("upperbody").checked}`);
 };
 $("stop").onclick   = () => api("/api/stop");
 $("estop").onclick  = () => api("/api/estop");
