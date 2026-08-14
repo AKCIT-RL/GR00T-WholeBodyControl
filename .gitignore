@@ -223,4 +223,6 @@ sonic_release/
 # Webcam teleop local assets (never version)
 external_dependencies/GENMO/
 /inputs
+/test_clips/
+/teleop_recordings/
 .github/agents/
