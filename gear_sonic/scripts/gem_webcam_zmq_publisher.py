@@ -11,6 +11,7 @@ IMPORTANT: run this with the GENMO virtual environment (GPU required):
         --render --render_mode opencv
 
 Published payload (pickle via send_pyobj), one message per inference frame:
+    tracking_valid    bool   True for pose frames; False for heartbeats
     body_pose         (63,)  float32  axis-angle, 21 SMPL body joints (in-camera decode)
     global_orient     (3,)   float32  axis-angle, GLOBAL y-up world frame (from rollout)
     transl            (3,)   float32  global translation (y-up world) — informational
@@ -20,6 +21,10 @@ Published payload (pickle via send_pyobj), one message per inference frame:
     timestamp_realtime float time.time()
     dt                float  seconds since previous published frame
     fps               float  smoothed inference fps
+
+Heartbeats (tracking_valid=False, with "reason": warmup|no_person) are published
+whenever no usable pose exists, so the bridge can tell "GEM alive, no person"
+apart from "GEM dead".
 """
 
 # ruff: noqa: E402, I001
@@ -62,7 +67,7 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
         self._zmq_pub = self._zmq_ctx.socket(zmq.PUB)
         self._zmq_pub.setsockopt(zmq.SNDHWM, 3)
         self._zmq_pub.setsockopt(zmq.LINGER, 0)
-        self._zmq_pub.bind(f"tcp://*:{args.zmq_port}")
+        self._zmq_pub.bind(f"tcp://{args.bind_host}:{args.zmq_port}")
         self._pub_count = 0
         self._last_pub_t = None
         self._headless = bool(getattr(args, "headless", False))
@@ -73,7 +78,23 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
             self._preview_pub.setsockopt(zmq.LINGER, 0)
             self._preview_pub.bind(f"tcp://127.0.0.1:{args.preview_port}")
             print(f"[ZMQ] Preview JPEG on tcp://127.0.0.1:{args.preview_port}")
-        print(f"[ZMQ] Publishing SMPL frames on tcp://*:{args.zmq_port}")
+        print(f"[ZMQ] Publishing SMPL frames on tcp://{args.bind_host}:{args.zmq_port}")
+
+    def _publish_heartbeat(self, reason: str):
+        """Tell the bridge GEM is alive but has no usable pose right now."""
+        try:
+            self._zmq_pub.send_pyobj(
+                {
+                    "tracking_valid": False,
+                    "reason": reason,
+                    "frame_index": int(self.frame_index),
+                    "timestamp_ns": time.monotonic_ns(),
+                    "timestamp_realtime": time.time(),
+                },
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            pass
 
     def _emit_preview_raw(self, frame_bgr):
         """Publish the raw camera frame so the UI shows video before tracking starts."""
@@ -112,6 +133,7 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
         self._last_pub_t = now_ns
 
         payload = {
+            "tracking_valid": True,
             "body_pose": incam["body_pose"].reshape(-1).numpy().astype(np.float32),
             "global_orient": glob["global_orient"].reshape(-1).numpy().astype(np.float32),
             "transl": glob["transl"].reshape(-1).numpy().astype(np.float32),
@@ -161,6 +183,7 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
                             self._emit_preview_raw(frame_bgr)
                     else:
                         self._emit_preview_raw(frame_bgr)
+                    self._publish_heartbeat("no_person")
                     print(f"\rFrame {self.frame_index}: no person detected", end="")
                     continue
 
@@ -190,6 +213,7 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
 
                 if not result["ready"]:
                     self._emit_preview_raw(frame_bgr)
+                    self._publish_heartbeat("warmup")
                     print(f"\rWarmup {result['warmup']} | tot={t['total']*1000:.0f}ms", end="")
                     continue
 
@@ -234,6 +258,10 @@ def parse_args():
     parser.add_argument("--camera_id", type=int, default=0, help="Webcam device ID")
     parser.add_argument("--video", type=str, default=None, help="Video file (overrides camera)")
     parser.add_argument("--zmq_port", type=int, default=5558, help="ZMQ PUB port for SMPL frames")
+    parser.add_argument(
+        "--bind_host", type=str, default="127.0.0.1",
+        help="Interface to bind the SMPL PUB socket (default: localhost only)",
+    )
     parser.add_argument(
         "--context_frames", type=int, default=120,
         help="Sliding window length (must match the exported denoiser seq_len)",
