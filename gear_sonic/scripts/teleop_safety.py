@@ -76,6 +76,10 @@ class SafetyLimits:
     resume_dwell_s: float = 1.0           # continuous valid frames required to resume
     resume_ramp_s: float = 1.0            # ramp from held/neutral pose to live pose
 
+    # --- Burst instability filter ---
+    unstable_window_s: float = 2.0        # window for counting rejected GEM samples
+    unstable_max_rejects: int = 4         # rejects in window -> treat tracking invalid
+
 
 # ---------------------------------------------------------------------------
 #  Quaternion / rotation helpers (wxyz convention, matching the bridge)

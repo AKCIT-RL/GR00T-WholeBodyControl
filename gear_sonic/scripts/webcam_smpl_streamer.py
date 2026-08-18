@@ -56,6 +56,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 
 from teleop_safety import (  # noqa: E402
     SafetyLimits,
+    SafetyState,
     SafetyStateMachine,
     pose_is_sane,
     sample_is_jump,
@@ -141,6 +142,39 @@ def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.nd
     if norm > 0:
         q = q / norm
     return q
+
+
+def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product of two wxyz quaternions."""
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _yaw_inverse_wxyz(q: np.ndarray) -> np.ndarray:
+    """Inverse of the z-up heading (yaw) component of a wxyz quaternion."""
+    w, x, y, z = q
+    heading = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return np.array(
+        [np.cos(-heading / 2.0), 0.0, 0.0, np.sin(-heading / 2.0)], dtype=np.float64
+    )
+
+
+def _yaw_wxyz(q: np.ndarray) -> np.ndarray:
+    """Z-up heading (yaw) component of a wxyz quaternion."""
+    w, x, y, z = q
+    heading = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return np.array(
+        [np.cos(heading / 2.0), 0.0, 0.0, np.sin(heading / 2.0)], dtype=np.float64
+    )
 
 
 def _interp_pose_axis_angle(
@@ -258,6 +292,7 @@ class GemReceiver:
         self._n_received = 0
         self._n_rejected = 0
         self._last_reject_reason = ""
+        self._reject_times: deque[float] = deque(maxlen=64)
         self._last_msg_ns = 0  # any message (incl. heartbeats) = GEM alive
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -359,8 +394,13 @@ class GemReceiver:
         if not ok:
             self._n_rejected += 1
             self._last_reject_reason = reason
+            self._reject_times.append(time.monotonic())
             return None
         return processed
+
+    def recent_rejects(self, window_s: float) -> int:
+        cutoff = time.monotonic() - window_s
+        return sum(1 for t in self._reject_times if t >= cutoff)
 
     def get_pair(self) -> tuple[dict | None, dict | None]:
         with self._lock:
@@ -463,6 +503,7 @@ def main():
 
     limits = SafetyLimits()
     neutral_frame = build_neutral_frame()
+    neutral_yaw = _yaw_wxyz(neutral_frame["body_quat"].astype(np.float64))
     machine = SafetyStateMachine(limits=limits, neutral_frame=neutral_frame)
 
     ctx = zmq.Context.instance()
@@ -484,6 +525,8 @@ def main():
     started = False  # becomes True on first arm; before that nothing is sent
     wire_mode: str | None = None  # "pose" | "planner"
     session_armed_t = 0.0
+    yaw_ref_inv: np.ndarray | None = None  # pilot heading calibration (wxyz)
+    unstable_reported = False
     frame_buffer: dict[str, deque] = defaultdict(lambda: deque(maxlen=args.num_frames_to_send))
     buffer_cleared = True
     step = 0
@@ -513,9 +556,10 @@ def main():
             pub.send(build_command_message(start=False, stop=True, planner=True))
 
     def arm(reason: str):
-        nonlocal started, session_armed_t
+        nonlocal started, session_armed_t, yaw_ref_inv
         started = True
         session_armed_t = time.monotonic()
+        yaw_ref_inv = None  # recalibrate pilot heading on each session
         machine.arm(time.monotonic())
         print(f"[Bridge] ARMED ({reason}) — robot will resume after ~"
               f"{limits.resume_dwell_s:.0f}s of valid tracking")
@@ -586,12 +630,37 @@ def main():
                 use_body_quat = _quat_lerp_normalized(
                     prev["body_quat_np"], curr["body_quat_np"], alpha
                 ).astype(np.float32)
+                # Keep recalibrating until tracking stabilizes; freeze while TRACKING.
+                # Reference heading = the neutral frame's heading (SMPL forward
+                # convention), so the pilot's facing at resume maps to "forward".
+                if yaw_ref_inv is None or machine.state != SafetyState.TRACKING:
+                    yaw_ref_inv = _quat_mul_wxyz(
+                        neutral_yaw, _yaw_inverse_wxyz(use_body_quat)
+                    )
+                use_body_quat = _quat_mul_wxyz(yaw_ref_inv, use_body_quat).astype(
+                    np.float32
+                )
                 live = {
                     "smpl_pose": use_pose,
                     "smpl_joints": use_joints,
                     "body_quat": use_body_quat,
                     "joint_pos": compute_g1_wrist_joint_pos(use_pose),
                 }
+
+            # --- Burst instability filter: too many rejected GEM samples in a
+            # short window means the stream is erratic; treat tracking as
+            # invalid so the machine holds/blends to neutral and only resumes
+            # after a clean dwell.
+            n_recent_rejects = receiver.recent_rejects(limits.unstable_window_s)
+            if live is not None and n_recent_rejects >= limits.unstable_max_rejects:
+                live = None
+                if not unstable_reported:
+                    unstable_reported = True
+                    print(f"[Bridge] UNSTABLE tracking — {n_recent_rejects} rejects "
+                          f"in {limits.unstable_window_s:.0f}s; holding until stable")
+            elif unstable_reported and n_recent_rejects == 0:
+                unstable_reported = False
+                print("[Bridge] tracking stable again")
 
             # --- Safety state machine ---
             out = machine.tick(now, live)
