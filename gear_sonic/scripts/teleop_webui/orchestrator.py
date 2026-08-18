@@ -217,6 +217,8 @@ def _make_specs(mode: str, camera_id: int, upper_body: bool = False) -> dict[str
     bridge_argv = [
         f"{root}/.venv_teleop/bin/python",
         "gear_sonic/scripts/webcam_smpl_streamer.py", "--auto_start",
+        # web UI has explicit Arm/E-STOP controls, so no demo session timer
+        "--session_timeout", "0",
     ]
     if upper_body:
         bridge_argv.append("--upper_body")
