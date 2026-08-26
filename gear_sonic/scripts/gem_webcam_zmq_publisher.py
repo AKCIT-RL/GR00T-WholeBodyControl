@@ -30,7 +30,9 @@ apart from "GEM dead".
 # ruff: noqa: E402, I001
 import argparse
 import queue as _queue_mod
+import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -58,14 +60,158 @@ import demo_webcam as _dw
 import cv2
 
 
+class FfmpegLatestCapture:
+    """cv2.VideoCapture-compatible reader for live stream URLs (RTSP/SRT/...).
+
+    OpenCV's FFmpeg backend buffers ~0.5 s on live RTSP and ignores the
+    low-latency options, so frames are read as rawvideo from an ffmpeg
+    subprocess instead (measured ~36 ms ingest->decode on localhost). A
+    background thread keeps only the newest frame; ``read()`` blocks until a
+    fresh frame arrives, so the caller is naturally paced at the source fps.
+    Reconnects automatically if the publisher drops.
+    """
+
+    def __init__(self, url: str):
+        self.url = url
+        self.width = 0
+        self.height = 0
+        self.fps = 30.0
+        self._cond = threading.Condition()
+        self._frame = None
+        self._seq = 0
+        self._released = False
+        self._proc = None
+        self._probe_blocking()
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+
+    def _input_flags(self) -> list:
+        flags = [
+            "-fflags", "nobuffer", "-flags", "low_delay",
+            "-probesize", "32768", "-analyzeduration", "0",
+        ]
+        if self.url.startswith("rtsp"):
+            flags = ["-rtsp_transport", "tcp"] + flags
+        return flags
+
+    def _probe_blocking(self):
+        """Wait until the stream exists, then read its geometry via ffprobe."""
+        cmd = [
+            "ffprobe", "-v", "error",
+            *(["-rtsp_transport", "tcp"] if self.url.startswith("rtsp") else []),
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,avg_frame_rate",
+            "-of", "csv=p=0", self.url,
+        ]
+        announced = 0.0
+        while True:
+            try:
+                out = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=15
+                ).stdout.strip()
+            except subprocess.TimeoutExpired:
+                out = ""
+            parts = out.split(",") if out else []
+            if len(parts) >= 2:
+                self.width, self.height = int(parts[0]), int(parts[1])
+                if len(parts) >= 3 and "/" in parts[2]:
+                    num, den = parts[2].split("/")
+                    if float(den or 0) > 0 and float(num) > 0:
+                        self.fps = float(num) / float(den)
+                print(
+                    f"\n[stream] connected: {self.url} "
+                    f"({self.width}x{self.height} @ {self.fps:.1f} fps)"
+                )
+                return
+            now = time.monotonic()
+            if now - announced > 10.0:
+                print(f"[stream] waiting for publisher at {self.url} …", flush=True)
+                announced = now
+            time.sleep(2.0)
+
+    def _reader_loop(self):
+        fsize = self.width * self.height * 3
+        while not self._released:
+            cmd = [
+                "ffmpeg", "-loglevel", "error", *self._input_flags(),
+                "-i", self.url, "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+            ]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=fsize
+            )
+            self._proc = proc
+            while not self._released:
+                buf = proc.stdout.read(fsize)
+                if buf is None or len(buf) < fsize:
+                    break
+                frame = np.frombuffer(buf, np.uint8).reshape(self.height, self.width, 3).copy()
+                with self._cond:
+                    self._frame = frame
+                    self._seq += 1
+                    self._cond.notify_all()
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            if not self._released:
+                print(f"\n[stream] disconnected — reconnecting to {self.url} …", flush=True)
+                time.sleep(1.0)
+
+    # --- cv2.VideoCapture-compatible surface used by demo_webcam ---
+    def read(self):
+        with self._cond:
+            start_seq = self._seq
+            while self._seq == start_seq and not self._released:
+                self._cond.wait(timeout=0.5)
+            if self._released:
+                return False, None
+            return True, self._frame
+
+    def get(self, prop) -> float:
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self.width)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self.height)
+        if prop == cv2.CAP_PROP_FPS:
+            return float(self.fps)
+        return 0.0
+
+    def set(self, prop, value) -> bool:
+        return False
+
+    def isOpened(self) -> bool:  # noqa: N802 (cv2 API)
+        return not self._released
+
+    def release(self):
+        self._released = True
+        with self._cond:
+            self._cond.notify_all()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+
+
 class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
     """WebcamGEMSMPLDemo with a ZMQ PUB socket for per-frame SMPL output."""
 
     def __init__(self, args):
-        super().__init__(args)
+        if getattr(args, "video_url", None):
+            # Parent takes the video branch; swap in the low-latency reader.
+            args.video = args.video_url
+            orig_vc = _dw.cv2.VideoCapture
+            _dw.cv2.VideoCapture = lambda src: (
+                FfmpegLatestCapture(src) if src == args.video_url else orig_vc(src)
+            )
+            try:
+                super().__init__(args)
+            finally:
+                _dw.cv2.VideoCapture = orig_vc
+        else:
+            super().__init__(args)
         # Phone videos store landscape pixels + a rotation tag that cv2 ignores
         # by default; enable auto-rotation and fix the derived intrinsics.
-        if getattr(args, "video", None):
+        if getattr(args, "video", None) and not getattr(args, "video_url", None):
             meta_rot = self.cap.get(cv2.CAP_PROP_ORIENTATION_META)
             if meta_rot and self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1):
                 if abs(meta_rot) % 180 == 90:
@@ -82,9 +228,10 @@ class ZmqWebcamGEMSMPLDemo(_dw.WebcamGEMSMPLDemo):
         self._last_pub_t = None
         self._headless = bool(getattr(args, "headless", False))
         # Video files are decoded as fast as inference allows; pace to source fps
-        # so the bridge sees a realtime stream like the webcam.
+        # so the bridge sees a realtime stream like the webcam. Live URLs are
+        # already paced by FfmpegLatestCapture.read() blocking on fresh frames.
         self._video_dt = 0.0
-        if getattr(args, "video", None):
+        if getattr(args, "video", None) and not getattr(args, "video_url", None):
             src_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
             if src_fps > 0:
                 self._video_dt = 1.0 / src_fps
@@ -281,6 +428,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="GEM-SMPL Webcam Demo + ZMQ publisher")
     parser.add_argument("--camera_id", type=int, default=0, help="Webcam device ID")
     parser.add_argument("--video", type=str, default=None, help="Video file (overrides camera)")
+    parser.add_argument(
+        "--video_url", type=str, default=None,
+        help="Live stream URL, e.g. rtsp://127.0.0.1:8554/cam (overrides camera/video)",
+    )
     parser.add_argument("--zmq_port", type=int, default=5558, help="ZMQ PUB port for SMPL frames")
     parser.add_argument(
         "--bind_host", type=str, default="127.0.0.1",
