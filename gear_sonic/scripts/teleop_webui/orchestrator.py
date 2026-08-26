@@ -382,6 +382,9 @@ class Orchestrator:
 
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
+        # GEM/bridge otherwise spawn OMP threads on all cores and starve the desktop
+        env.setdefault("OMP_NUM_THREADS", "4")
+        env.setdefault("MKL_NUM_THREADS", "4")
         specs = _make_specs(mode, camera_id, upper_body, video_source)
         self.components = {name: Component(spec) for name, spec in specs.items()}
         self.global_state = "starting"

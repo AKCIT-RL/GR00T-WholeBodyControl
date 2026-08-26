@@ -133,7 +133,7 @@ class FfmpegLatestCapture:
         fsize = self.width * self.height * 3
         while not self._released:
             cmd = [
-                "ffmpeg", "-loglevel", "error", *self._input_flags(),
+                "ffmpeg", "-loglevel", "error", "-threads", "2", *self._input_flags(),
                 "-i", self.url, "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
             ]
             proc = subprocess.Popen(
