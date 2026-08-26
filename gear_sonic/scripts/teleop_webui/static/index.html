@@ -157,7 +157,9 @@ function render() {
   const hint = $("phonehint");
   if (s.publish_url && ["starting","running"].includes(s.global_state)) {
     hint.style.display = "block";
-    hint.innerHTML = `\u{1F4F1} On the phone, open <b>${s.publish_url}</b>, accept the certificate warning and tap <b>Publish</b>.`;
+    let urls = `same Wi-Fi: <b>${s.publish_url}</b>`;
+    if (s.publish_url_ts) urls += ` &nbsp;\u00B7&nbsp; via Tailscale: <b>${s.publish_url_ts}</b>`;
+    hint.innerHTML = `\u{1F4F1} On the phone, open the publish page \u2014 ${urls} \u2014 accept the certificate warning and tap <b>Publish</b>.`;
   } else {
     hint.style.display = "none";
   }

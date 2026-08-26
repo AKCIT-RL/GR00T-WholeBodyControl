@@ -479,6 +479,7 @@ class Orchestrator:
             "mode": self.mode,
             "video_source": self.video_source,
             "publish_url": self.publish_url() if self.video_source == "phone" else None,
+            "publish_url_ts": self.publish_url_tailscale() if self.video_source == "phone" else None,
             "components": {name: comp.status() for name, comp in self.components.items()},
             "preflight": self.preflight_results,
         }
@@ -487,6 +488,21 @@ class Orchestrator:
     @staticmethod
     def publish_url() -> str:
         return f"https://{Orchestrator._lan_ip()}:8889/cam/publish"
+
+    @staticmethod
+    def publish_url_tailscale() -> str | None:
+        ip = Orchestrator._tailscale_ip()
+        return f"https://{ip}:8889/cam/publish" if ip else None
+
+    @staticmethod
+    def _tailscale_ip() -> str | None:
+        try:
+            out = subprocess.run(
+                ["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3
+            ).stdout.strip().splitlines()
+            return out[0] if out else None
+        except Exception:
+            return None
 
     @staticmethod
     def _lan_ip() -> str:
