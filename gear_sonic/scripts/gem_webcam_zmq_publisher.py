@@ -134,7 +134,8 @@ class FfmpegLatestCapture:
         while not self._released:
             cmd = [
                 "ffmpeg", "-loglevel", "error", "-threads", "2", *self._input_flags(),
-                "-i", self.url, "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+                "-i", self.url, "-vsync", "0",
+                "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
             ]
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=fsize
