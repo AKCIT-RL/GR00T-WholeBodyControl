@@ -94,10 +94,15 @@ async def preview():
 
 
 @app.post("/api/start")
-async def api_start(mode: str = "sim", camera_id: int = 0, upper_body: bool = False):
+async def api_start(
+    mode: str = "sim", camera_id: int = 0, upper_body: bool = False,
+    video_source: str = "webcam",
+):
     if mode not in ("sim", "real"):
         return JSONResponse({"ok": False, "error": "mode must be sim|real"}, status_code=400)
-    ok = orch.start(mode=mode, camera_id=camera_id, upper_body=upper_body)
+    if video_source not in ("webcam", "phone"):
+        return JSONResponse({"ok": False, "error": "video_source must be webcam|phone"}, status_code=400)
+    ok = orch.start(mode=mode, camera_id=camera_id, upper_body=upper_body, video_source=video_source)
     return {"ok": ok}
 
 
@@ -125,8 +130,8 @@ async def api_key(payload: dict):
 
 
 @app.get("/api/preflight")
-async def api_preflight(mode: str = "sim"):
-    return {"checks": orch.preflight(mode)}
+async def api_preflight(mode: str = "sim", video_source: str = "webcam"):
+    return {"checks": orch.preflight(mode, video_source)}
 
 
 @app.get("/api/status")

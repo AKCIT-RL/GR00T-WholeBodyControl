@@ -103,6 +103,25 @@ you never type or click in it; everything is controlled from the page:
 The **Upper body mode** checkbox (default on) restricts imitation to arms and
 torso — legs and root orientation stay neutral. Recommended for public demos.
 
+### Phone camera (remote)
+
+Select **Phone camera (remote)** in the camera dropdown before START. The
+orchestrator additionally launches MediaMTX (expected at
+`~/.local/opt/mediamtx/mediamtx`, config `gear_sonic/config/mediamtx_teleop.yml`)
+and GEM reads `rtsp://127.0.0.1:8554/cam` instead of the webcam. While starting,
+the page shows the publish URL — on the phone (same network or tailnet), open
+`https://<PC-IP>:8889/cam/publish`, accept the self-signed certificate warning
+and tap **Publish** (rear camera recommended). GEM waits for the stream, then
+proceeds normally. Alternative publishers into the same path:
+
+- SRT app (e.g. Larix Broadcaster): `srt://<PC-IP>:8890?streamid=publish:cam`
+- ffmpeg push: `ffmpeg -re -i src -c:v libx264 -tune zerolatency -f rtsp rtsp://<PC-IP>:8554/cam`
+
+If the phone drops, GEM auto-reconnects and the bridge safety layer holds the
+robot in a safe pose meanwhile. Note: the GEM frame reader uses a raw ffmpeg
+subprocess (~36 ms ingest→decode measured on localhost); OpenCV's VideoCapture
+adds ~0.5 s of undroppable buffering on live RTSP and must not be used here.
+
 The manual procedure below remains the reference and fallback.
 
 ---

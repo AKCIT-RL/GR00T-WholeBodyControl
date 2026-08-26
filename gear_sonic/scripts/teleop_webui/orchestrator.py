@@ -29,6 +29,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 PREVIEW_PORT = 5559
 CHECK_PORTS = (5556, 5557, 5558, PREVIEW_PORT)
 
+MEDIAMTX_BIN = Path.home() / ".local/opt/mediamtx/mediamtx"
+MEDIAMTX_CONF = REPO_ROOT / "gear_sonic/config/mediamtx_teleop.yml"
+MEDIAMTX_PORTS = (8554, 8889, 8890)
+STREAM_URL = "rtsp://127.0.0.1:8554/cam"
+
 KEY_MAP = {"enter": "\r", "]": "]", "o": "o", "i": "i", "f": "f", "s": "s", "p": "p"}
 ALLOWED_KEYS = {
     "cpp": {"]", "enter", "o", "i", "f"},
@@ -166,9 +171,19 @@ class Component:
         }
 
 
-def _make_specs(mode: str, camera_id: int, upper_body: bool = False) -> dict[str, ComponentSpec]:
+def _make_specs(
+    mode: str, camera_id: int, upper_body: bool = False, video_source: str = "webcam"
+) -> dict[str, ComponentSpec]:
     root = str(REPO_ROOT)
     specs = {}
+    if video_source == "phone":
+        specs["mediamtx"] = ComponentSpec(
+            name="mediamtx",
+            argv=[str(MEDIAMTX_BIN), str(MEDIAMTX_CONF)],
+            cwd=str(MEDIAMTX_BIN.parent),
+            ready_pattern=re.compile(r"\[WebRTC\] listener opened"),
+            ready_timeout=20.0,
+        )
     if mode == "sim":
         specs["sim"] = ComponentSpec(
             name="sim",
@@ -196,6 +211,10 @@ def _make_specs(mode: str, camera_id: int, upper_body: bool = False) -> dict[str
         ready_pattern=re.compile(r"Init Done"),
         ready_timeout=600.0,
     )
+    gem_source = (
+        ["--video_url", STREAM_URL] if video_source == "phone"
+        else ["--camera_id", str(camera_id)]
+    )
     specs["gem"] = ComponentSpec(
         name="gem",
         argv=[
@@ -203,15 +222,17 @@ def _make_specs(mode: str, camera_id: int, upper_body: bool = False) -> dict[str
             "gear_sonic/scripts/gem_webcam_zmq_publisher.py",
             "--no_imgfeat", "--render", "--render_mode", "opencv",
             "--headless", "--preview_port", str(PREVIEW_PORT),
-            "--camera_id", str(camera_id),
+            *gem_source,
         ],
         cwd=root,
         ready_pattern=re.compile(r"\[ZMQ\] Publishing SMPL frames"),
-        ready_timeout=180.0,
+        # phone mode blocks until the operator starts publishing from the phone
+        ready_timeout=900.0 if video_source == "phone" else 180.0,
         parsers=[
             (re.compile(r"Warmup (?P<warmup>\d+)"), "gem_"),
             (re.compile(r"FPS\s+[\d.]+\s+\(avg\s+(?P<fps>[\d.]+)\)"), "gem_"),
             (re.compile(r"(?P<no_person>no person detected)"), "gem_"),
+            (re.compile(r"\[stream\] (?P<stream>.+)"), "gem_"),
         ],
     )
     bridge_argv = [
@@ -239,19 +260,20 @@ def _make_specs(mode: str, camera_id: int, upper_body: bool = False) -> dict[str
 
 
 class Orchestrator:
-    START_ORDER = ["sim", "cpp", "gem", "bridge"]
+    START_ORDER = ["mediamtx", "sim", "cpp", "gem", "bridge"]
 
     def __init__(self):
         self.components: dict[str, Component] = {}
         self.global_state = "idle"  # idle|preflight|starting|running|stopping|error
         self.detail = ""
         self.mode = "sim"
+        self.video_source = "webcam"
         self.preflight_results: list[dict] = []
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
 
     # ------------------------------------------------------------------ preflight
-    def preflight(self, mode: str) -> list[dict]:
+    def preflight(self, mode: str, video_source: str = "webcam") -> list[dict]:
         checks = []
 
         def add(name, ok, detail, hard=True):
@@ -268,7 +290,13 @@ class Orchestrator:
             add(label, os.access(path, os.X_OK), str(path))
 
         cams = sorted(glob.glob("/dev/video*"))
-        add("webcam", bool(cams), ", ".join(cams) or "no /dev/video* device")
+        if video_source == "phone":
+            add("mediamtx", os.access(MEDIAMTX_BIN, os.X_OK), str(MEDIAMTX_BIN))
+            for port in MEDIAMTX_PORTS:
+                free = self._port_free(port)
+                add(f"port {port}", free, "free" if free else "IN USE — kill leftover mediamtx (Cleanup button)")
+        else:
+            add("webcam", bool(cams), ", ".join(cams) or "no /dev/video* device")
 
         for port in CHECK_PORTS:
             free = self._port_free(port)
@@ -321,30 +349,40 @@ class Orchestrator:
             return None
 
     # ------------------------------------------------------------------ lifecycle
-    def start(self, mode: str = "sim", camera_id: int = 0, upper_body: bool = False) -> bool:
+    def start(
+        self, mode: str = "sim", camera_id: int = 0, upper_body: bool = False,
+        video_source: str = "webcam",
+    ) -> bool:
         with self._lock:
             if self.global_state in ("starting", "running", "stopping"):
                 return False
             self.mode = mode
+            self.video_source = video_source
             self.global_state = "preflight"
             self.detail = ""
             self._worker = threading.Thread(
-                target=self._start_sequence, args=(mode, camera_id, upper_body), daemon=True
+                target=self._start_sequence, args=(mode, camera_id, upper_body, video_source),
+                daemon=True,
             )
             self._worker.start()
             return True
 
-    def _start_sequence(self, mode: str, camera_id: int, upper_body: bool = False):
-        checks = self.preflight(mode)
+    def _start_sequence(self, mode: str, camera_id: int, upper_body: bool, video_source: str):
+        checks = self.preflight(mode, video_source)
         hard_fail = [c for c in checks if c["hard"] and not c["ok"]]
         if hard_fail:
             self.global_state = "error"
             self.detail = "Pre-flight failed: " + "; ".join(c["name"] for c in hard_fail)
             return
 
+        if video_source == "phone" and not self._ensure_certs():
+            self.global_state = "error"
+            self.detail = "could not generate the TLS certificate for MediaMTX (openssl missing?)"
+            return
+
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
-        specs = _make_specs(mode, camera_id, upper_body)
+        specs = _make_specs(mode, camera_id, upper_body, video_source)
         self.components = {name: Component(spec) for name, spec in specs.items()}
         self.global_state = "starting"
 
@@ -353,6 +391,8 @@ class Orchestrator:
             if comp is None:
                 continue
             self.detail = f"starting {name}…"
+            if name == "gem" and video_source == "phone":
+                self.detail = f"waiting for the phone camera — open {self.publish_url()} on the phone"
             comp.start(env)
             if not comp.wait_ready():
                 self.global_state = "error"
@@ -415,7 +455,10 @@ class Orchestrator:
 
     def cleanup(self):
         """Kill leftover processes from previous runs (frees the ZMQ ports)."""
-        for pat in ("g1_deploy_onnx_ref", "run_sim_loop", "webcam_smpl_streamer", "gem_webcam_zmq_publisher"):
+        for pat in (
+            "g1_deploy_onnx_ref", "run_sim_loop", "webcam_smpl_streamer",
+            "gem_webcam_zmq_publisher", "mediamtx",
+        ):
             subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
         time.sleep(1.0)
 
@@ -434,6 +477,39 @@ class Orchestrator:
             "global_state": self.global_state,
             "detail": self.detail,
             "mode": self.mode,
+            "video_source": self.video_source,
+            "publish_url": self.publish_url() if self.video_source == "phone" else None,
             "components": {name: comp.status() for name, comp in self.components.items()},
             "preflight": self.preflight_results,
         }
+
+    # ------------------------------------------------------------------ phone camera
+    @staticmethod
+    def publish_url() -> str:
+        return f"https://{Orchestrator._lan_ip()}:8889/cam/publish"
+
+    @staticmethod
+    def _lan_ip() -> str:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+
+    @staticmethod
+    def _ensure_certs() -> bool:
+        """Self-signed TLS cert for the WHIP page (phone getUserMedia needs HTTPS)."""
+        cert_dir = MEDIAMTX_BIN.parent
+        key, crt = cert_dir / "server.key", cert_dir / "server.crt"
+        if key.exists() and crt.exists():
+            return True
+        res = subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key), "-out", str(crt), "-days", "3650",
+                "-subj", "/CN=g1-teleop",
+            ],
+            capture_output=True,
+        )
+        return res.returncode == 0

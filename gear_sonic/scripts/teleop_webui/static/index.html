@@ -64,12 +64,17 @@
         <option value="sim" selected>Simulation</option>
         <option value="real">Real robot</option>
       </select>
+      <select id="camsource" title="Video source for pose estimation">
+        <option value="webcam" selected>Local webcam</option>
+        <option value="phone">Phone camera (remote)</option>
+      </select>
       <label class="dim" style="cursor:pointer" title="Only arms/torso are imitated; legs and pelvis stay neutral. 90 s session timer.">
         <input type="checkbox" id="upperbody" checked> Upper body mode
       </label>
       <button id="cleanup" class="btn-small" title="Kill leftover processes / free ports">Cleanup</button>
     </div>
     <div id="detail" class="dim"></div>
+    <div id="phonehint" style="display:none; margin-top:8px; padding:8px 12px; background:#1c3a52; border-radius:8px; font-size:14px"></div>
   </div>
 
   <div class="grid">
@@ -109,14 +114,14 @@
 <script>
 const $ = id => document.getElementById(id);
 let status = {}, logTab = "bridge";
-const COMP_LABELS = { sim:"Simulator", cpp:"C++ controller", gem:"GEM (webcam)", bridge:"Bridge" };
+const COMP_LABELS = { mediamtx:"MediaMTX (ingest)", sim:"Simulator", cpp:"C++ controller", gem:"GEM (pose)", bridge:"Bridge" };
 
 function api(path, opts) { return fetch(path, Object.assign({method:"POST"}, opts)); }
 
 $("start").onclick = () => {
   const mode = $("mode").value;
   if (mode === "real" && !confirm("REAL ROBOT mode. Sim validated? Gantry + e-stop operator ready?")) return;
-  api(`/api/start?mode=${mode}&upper_body=${$("upperbody").checked}`);
+  api(`/api/start?mode=${mode}&upper_body=${$("upperbody").checked}&video_source=${$("camsource").value}`);
 };
 $("stop").onclick   = () => api("/api/stop");
 $("estop").onclick  = () => api("/api/estop");
@@ -127,8 +132,10 @@ function sendKey(component, key) {
 }
 
 function preflight() {
-  fetch(`/api/preflight?mode=${$("mode").value}`).then(r=>r.json()).then(d => renderChecks(d.checks));
+  fetch(`/api/preflight?mode=${$("mode").value}&video_source=${$("camsource").value}`)
+    .then(r=>r.json()).then(d => renderChecks(d.checks));
 }
+$("camsource").onchange = preflight;
 function renderChecks(checks) {
   $("checks").innerHTML = (checks||[]).map(c =>
     `<li class="${c.ok?'ok':'fail'}"><b>${c.name}</b> <span class="dim">${c.detail}</span></li>`).join("");
@@ -146,6 +153,14 @@ function render() {
   b.className = "banner" + (s.global_state==="error" ? " error" : running ? " running" : "");
   b.textContent = s.global_state==="error" ? "ERROR: " + s.detail
                 : running ? "RUNNING — robot is imitating. E-STOP is always available." : "";
+
+  const hint = $("phonehint");
+  if (s.publish_url && ["starting","running"].includes(s.global_state)) {
+    hint.style.display = "block";
+    hint.innerHTML = `\u{1F4F1} On the phone, open <b>${s.publish_url}</b>, accept the certificate warning and tap <b>Publish</b>.`;
+  } else {
+    hint.style.display = "none";
+  }
 
   const comps = s.components || {};
   $("components").innerHTML = Object.keys(COMP_LABELS).filter(k=>comps[k]).map(k => {
